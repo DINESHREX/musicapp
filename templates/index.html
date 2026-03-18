@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🎵 Music Pipeline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">🎵</div>
+  <div>
+    <h1>Music Pipeline</h1>
+    <span class="header-sub">Bulk Song Processor & Downloader — localhost:5000</span>
+  </div>
+  <div class="server-badge">● LIVE</div>
+</div>
+
+<div class="main">
+
+  <!-- SIDEBAR -->
+  <nav class="sidebar">
+    <span class="sidebar-label">Steps</span>
+    <button class="step-btn active" onclick="goTo(0)" id="sbtn0"><span class="step-num" id="snum0">1</span>Upload Songs</button>
+    <button class="step-btn" onclick="goTo(1)" id="sbtn1"><span class="step-num" id="snum1">2</span>Review List</button>
+    <button class="step-btn" onclick="goTo(2)" id="sbtn2"><span class="step-num" id="snum2">3</span>Tool Setup</button>
+    <button class="step-btn" onclick="goTo(3)" id="sbtn3"><span class="step-num" id="snum3">4</span>Download</button>
+    <button class="step-btn" onclick="goTo(4)" id="sbtn4"><span class="step-num" id="snum4">5</span>Results</button>
+
+    <span class="sidebar-label" style="margin-top:28px;">Tool Status</span>
+    <div class="tool-status-row" id="sb_spotdl">
+      <span class="tool-status-name">SpotDL</span><span id="badge_spotdl" class="badge badge-gray">?</span>
+    </div>
+    <div class="tool-status-row" id="sb_ytdlp">
+      <span class="tool-status-name">yt-dlp</span><span id="badge_ytdlp" class="badge badge-gray">?</span>
+    </div>
+    <div class="tool-status-row" id="sb_deemix">
+      <span class="tool-status-name">Deemix</span><span id="badge_deemix" class="badge badge-gray">?</span>
+    </div>
+    <div class="tool-status-row" id="sb_ffmpeg">
+      <span class="tool-status-name">FFmpeg</span><span id="badge_ffmpeg" class="badge badge-gray">?</span>
+    </div>
+    <button class="btn btn-secondary" style="margin-top:10px;width:100%;font-size:12px;" onclick="checkAllTools()">↺ Refresh Status</button>
+  </nav>
+
+  <!-- CONTENT -->
+  <main class="content">
+
+    <!-- ── STEP 1: UPLOAD ── -->
+    <div class="panel active" id="panel0">
+      <div class="panel-header">
+        <h2>Step 1 — Upload Your Song List</h2>
+        <p>Upload a CSV or Excel file with Track Name and Artist Name columns. Or paste song data directly.</p>
+      </div>
+
+      <div class="card">
+        <p class="card-title">Input Method</p>
+        <div class="tab-row">
+          <button class="tab active" onclick="switchTab('file')" id="tab_file">📄 Upload File</button>
+          <button class="tab" onclick="switchTab('paste')" id="tab_paste">✏️ Paste Text</button>
+          <button class="tab" onclick="switchTab('sample')" id="tab_sample">🎲 Sample Data</button>
+        </div>
+
+        <div id="input_file">
+          <div class="drop-zone" id="drop_zone" onclick="document.getElementById('file_input').click()">
+            <div class="drop-icon">📂</div>
+            <p>Drop your CSV or Excel file here</p>
+            <span>or click to browse</span>
+            <input type="file" id="file_input" accept=".csv,.xlsx,.xls" onchange="handleUpload(event)" style="display:none">
+          </div>
+          <div class="alert alert-info" style="margin-top:12px;">
+            <span>ℹ</span>
+            <div>Required columns: <code>Track Name</code> and <code>Artist Name</code> (auto-detected, case-insensitive)</div>
+          </div>
+        </div>
+
+        <div id="input_paste" style="display:none;">
+          <label>One song per line. Format: <code style="color:var(--accent)">Song – Artist</code> or <code style="color:var(--accent)">Song, Artist</code></label>
+          <textarea id="paste_area" placeholder="Blinding Lights – The Weeknd&#10;Shape of You – Ed Sheeran&#10;Levitating – Dua Lipa"></textarea>
+          <button class="btn btn-primary" style="margin-top:12px;" onclick="parsePaste()">Parse Songs →</button>
+        </div>
+
+        <div id="input_sample" style="display:none;">
+          <div class="alert alert-ok">
+            <span>✓</span>
+            <div>Will load 20 sample popular songs to demonstrate the pipeline.</div>
+          </div>
+          <button class="btn btn-primary" style="margin-top:12px;" onclick="loadSample()">Load Sample Songs →</button>
+        </div>
+      </div>
+
+      <div id="upload_result" style="display:none;">
+        <div class="alert alert-ok" id="upload_ok_msg"></div>
+        <button class="btn btn-primary" style="margin-top:16px;" onclick="goTo(1)">Review Song List →</button>
+      </div>
+    </div>
+
+    <!-- ── STEP 2: REVIEW ── -->
+    <div class="panel" id="panel1">
+      <div class="panel-header">
+        <h2>Step 2 — Review Song List</h2>
+        <p>Edit, remove duplicates, or add songs manually before downloading.</p>
+      </div>
+
+      <div class="stats-row">
+        <div class="stat-card"><div class="stat-num stat-accent" id="r_total">0</div><div class="stat-label">Songs</div></div>
+        <div class="stat-card"><div class="stat-num stat-warn" id="r_dupes">0</div><div class="stat-label">Duplicates</div></div>
+        <div class="stat-card"><div class="stat-num stat-accent" id="r_ready">0</div><div class="stat-label">Ready</div></div>
+      </div>
+
+      <div class="card">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <p class="card-title" style="margin:0;">songs.txt</p>
+          <div style="display:flex;gap:8px;">
+            <button class="btn btn-secondary btn-sm" onclick="dedupeList()">Remove Duplicates</button>
+            <button class="btn btn-secondary btn-sm" onclick="sortList()">Sort A–Z</button>
+            <button class="btn btn-secondary btn-sm" onclick="downloadSongsTxt()">⬇ Download</button>
+          </div>
+        </div>
+        <textarea id="songs_editor" style="min-height:300px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.8;" oninput="refreshStats()"></textarea>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="goTo(0)">← Back</button>
+        <button class="btn btn-primary" onclick="goTo(2)">Configure Tool →</button>
+      </div>
+    </div>
+
+    <!-- ── STEP 3: TOOL SETUP ── -->
+    <div class="panel" id="panel2">
+      <div class="panel-header">
+        <h2>Step 3 — Tool & Quality Setup</h2>
+        <p>Check which tools are installed, copy the CMD commands below, then come back and pick your quality settings.</p>
+      </div>
+
+      <!-- DEPENDENCY STATUS BOARD -->
+      <div class="card">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+          <p class="card-title" style="margin:0;">Dependency Status</p>
+          <button class="btn btn-secondary btn-sm" onclick="checkAllTools()">↺ Re-check</button>
+        </div>
+        <div class="dep-grid">
+          <div class="dep-row">
+            <div class="dep-info">
+              <span class="dep-name">yt-dlp</span>
+              <span class="dep-desc">Download engine (YouTube Music)</span>
+            </div>
+            <span class="dep-status" id="ds_ytdlp">Checking…</span>
+          </div>
+          <div class="dep-row">
+            <div class="dep-info">
+              <span class="dep-name">FFmpeg</span>
+              <span class="dep-desc">Audio conversion — required by yt-dlp</span>
+            </div>
+            <span class="dep-status" id="ds_ffmpeg">Checking…</span>
+          </div>
+          <div class="dep-row">
+            <div class="dep-info">
+              <span class="dep-name">SpotDL</span>
+              <span class="dep-desc">Spotify-based matching (alternative)</span>
+            </div>
+            <span class="dep-status" id="ds_spotdl">Checking…</span>
+          </div>
+          <div class="dep-row" style="border-bottom:none;">
+            <div class="dep-info">
+              <span class="dep-name">Deemix</span>
+              <span class="dep-desc">FLAC quality via Deezer (needs ARL token)</span>
+            </div>
+            <span class="dep-status" id="ds_deemix">Checking…</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- CMD INSTALL INSTRUCTIONS -->
+      <div class="card">
+        <p class="card-title">📋 Install Missing Tools — Run in CMD / Anaconda Prompt</p>
+
+        <div class="alert alert-warn" style="margin-bottom:16px;">
+          <span>⚠</span>
+          <div>Do <strong>not</strong> install from inside this app. Open your <strong>Anaconda Prompt</strong> or <strong>CMD</strong>, run the commands below, then click <strong>Re-check</strong> above.</div>
+        </div>
+
+        <div class="cmd-block-label">Step A — Install Python tools</div>
+        <div class="cmd-block">
+          <div class="cmd-line">
+            <span class="cmd-prompt">pip install</span>
+            <span class="cmd-text">yt-dlp spotdl</span>
+            <button class="cmd-copy" onclick="copyText('pip install yt-dlp spotdl')">Copy</button>
+          </div>
+        </div>
+
+        <div class="cmd-block-label" style="margin-top:18px;">Step B — Install FFmpeg (required for audio conversion)</div>
+        <div class="cmd-block">
+          <div class="cmd-line">
+            <span class="cmd-prompt">winget install</span>
+            <span class="cmd-text">--id Gyan.FFmpeg -e --accept-source-agreements</span>
+            <button class="cmd-copy" onclick="copyText('winget install --id Gyan.FFmpeg -e --accept-source-agreements')">Copy</button>
+          </div>
+        </div>
+        <div class="alert alert-info" style="margin-top:10px;">
+          <span>ℹ</span>
+          <div>After installing FFmpeg, <strong>close and reopen</strong> your CMD/Anaconda Prompt, then restart <code>python app.py</code> and click Re-check.</div>
+        </div>
+
+        <div class="cmd-block-label" style="margin-top:18px;">Step C — Verify everything works</div>
+        <div class="cmd-block">
+          <div class="cmd-line">
+            <span class="cmd-prompt">verify</span>
+            <span class="cmd-text">yt-dlp --version &amp;&amp; ffmpeg -version &amp;&amp; spotdl --version</span>
+            <button class="cmd-copy" onclick="copyText('yt-dlp --version && ffmpeg -version && spotdl --version')">Copy</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- TOOL SELECTION -->
+      <div class="card">
+        <p class="card-title">Select Download Tool</p>
+        <div class="tool-grid">
+          <div class="tool-card selected" id="tc_spotdl" onclick="selectTool('spotdl')">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+              <span style="font-size:20px;">🎵</span>
+              <span class="tool-name">SpotDL</span>
+              <span class="badge badge-green" style="margin-left:auto;">Recommended</span>
+            </div>
+            <div class="tool-desc">Spotify metadata · auto album art · lyrics</div>
+            <div class="tool-status" id="ts_spotdl">Checking...</div>
+          </div>
+          <div class="tool-card" id="tc_ytdlp" onclick="selectTool('yt-dlp')">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+              <span style="font-size:20px;">📺</span>
+              <span class="tool-name">yt-dlp</span>
+              <span class="badge badge-blue" style="margin-left:auto;">Free</span>
+            </div>
+            <div class="tool-desc">YouTube Music · widest coverage · needs FFmpeg</div>
+            <div class="tool-status" id="ts_ytdlp">Checking...</div>
+          </div>
+          <div class="tool-card" id="tc_deemix" onclick="selectTool('deemix')">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+              <span style="font-size:20px;">💿</span>
+              <span class="tool-name">Deemix</span>
+              <span class="badge badge-amber" style="margin-left:auto;">FLAC</span>
+            </div>
+            <div class="tool-desc">Deezer · lossless FLAC · needs ARL token</div>
+            <div class="tool-status" id="ts_deemix">Checking...</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- QUALITY -->
+      <div class="two-col">
+        <div class="card">
+          <p class="card-title">Audio Quality</p>
+          <div class="quality-opts">
+            <label class="q-opt"><input type="radio" name="quality" value="128k"> <span>128 kbps</span> <span class="badge badge-amber">Low</span></label>
+            <label class="q-opt"><input type="radio" name="quality" value="256k"> <span>256 kbps</span> <span class="badge badge-blue">Good</span></label>
+            <label class="q-opt active"><input type="radio" name="quality" value="320k" checked> <span>320 kbps</span> <span class="badge badge-green">Best MP3</span></label>
+            <label class="q-opt"><input type="radio" name="quality" value="flac"> <span>FLAC</span> <span class="badge badge-amber">Lossless</span></label>
+          </div>
+        </div>
+        <div class="card">
+          <p class="card-title">Audio Format</p>
+          <div class="quality-opts">
+            <label class="q-opt active"><input type="radio" name="format" value="mp3" checked> <span>MP3</span></label>
+            <label class="q-opt"><input type="radio" name="format" value="m4a"> <span>M4A / AAC</span></label>
+            <label class="q-opt"><input type="radio" name="format" value="opus"> <span>Opus</span></label>
+            <label class="q-opt"><input type="radio" name="format" value="flac"> <span>FLAC</span></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="goTo(1)">← Back</button>
+        <button class="btn btn-primary" onclick="startDownload()">Start Download →</button>
+      </div>
+    </div>
+
+    <!-- ── STEP 4: DOWNLOAD ── -->
+    <div class="panel" id="panel3">
+      <div class="panel-header">
+        <h2>Step 4 — Downloading</h2>
+        <p>Songs are being downloaded on your machine. Watch real-time progress below.</p>
+      </div>
+
+      <div class="stats-row">
+        <div class="stat-card"><div class="stat-num stat-muted" id="dl_total">0</div><div class="stat-label">Total</div></div>
+        <div class="stat-card"><div class="stat-num stat-accent" id="dl_done">0</div><div class="stat-label">Downloaded</div></div>
+        <div class="stat-card"><div class="stat-num stat-warn" id="dl_pending">0</div><div class="stat-label">Pending</div></div>
+        <div class="stat-card"><div class="stat-num stat-err" id="dl_failed">0</div><div class="stat-label">Failed</div></div>
+      </div>
+
+      <div class="progress-wrap">
+        <div class="progress-fill" id="progress_fill" style="width:0%"></div>
+      </div>
+      <p id="progress_pct" style="text-align:right;font-size:13px;color:var(--muted);margin-top:4px;">0%</p>
+
+      <div class="card">
+        <div class="terminal">
+          <div class="term-header"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div><span class="term-title" id="term_title">download engine</span></div>
+          <div id="dl_log"></div>
+        </div>
+      </div>
+
+      <div id="dl_done_bar" style="display:none;" class="btn-row">
+        <button class="btn btn-primary" onclick="goTo(4)">View Results →</button>
+      </div>
+    </div>
+
+    <!-- ── STEP 5: RESULTS ── -->
+    <div class="panel" id="panel4">
+      <div class="panel-header">
+        <h2>Step 5 — Results</h2>
+        <p>Download complete. Your songs are saved locally.</p>
+      </div>
+
+      <div class="stats-row">
+        <div class="stat-card"><div class="stat-num stat-accent" id="res_total">0</div><div class="stat-label">Total</div></div>
+        <div class="stat-card"><div class="stat-num stat-accent" id="res_done">0</div><div class="stat-label">Downloaded</div></div>
+        <div class="stat-card"><div class="stat-num stat-err" id="res_failed">0</div><div class="stat-label">Failed</div></div>
+        <div class="stat-card"><div class="stat-num stat-warn" id="res_rate">—</div><div class="stat-label">Success Rate</div></div>
+      </div>
+
+      <div class="card">
+        <p class="card-title">Output Folder</p>
+        <div class="path-box" id="res_path">—</div>
+        <div class="btn-row" style="margin-top:12px;">
+          <button class="btn btn-primary" id="zip_btn" onclick="downloadZip()">⬇ Download All as ZIP</button>
+          <button class="btn btn-secondary" id="fail_btn" onclick="downloadFailed()" style="display:none;">⬇ Download Failed List</button>
+        </div>
+      </div>
+
+      <div class="card" id="failed_card" style="display:none;">
+        <p class="card-title">Failed Songs</p>
+        <div id="failed_list_el" style="font-family:'JetBrains Mono',monospace;font-size:13px;line-height:2;color:var(--muted);"></div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="resetAll()">↺ New Pipeline</button>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
