@@ -25,9 +25,9 @@ import pandas as pd
 
 app = Flask(__name__)
 
-# ── Vercel detection: use /tmp when running on Vercel ──
-IS_VERCEL = os.environ.get('VERCEL') == '1'
-if IS_VERCEL:
+# ── Cloud detection: use /tmp on Vercel / Railway (ephemeral FS) ──
+IS_CLOUD = os.environ.get('VERCEL') == '1' or os.environ.get('RAILWAY_ENVIRONMENT') is not None
+if IS_CLOUD:
     app.config['DOWNLOAD_FOLDER'] = '/tmp/downloads'
     app.config['UPLOAD_FOLDER']   = '/tmp/uploads'
 else:
