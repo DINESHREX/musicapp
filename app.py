@@ -1,12 +1,11 @@
 """
-Music Pipeline — Flask Web App
+MusicDL — Flask Web App
 Run: python app.py
 Open: http://localhost:5000
 """
 
 import os
 import sys
-import csv
 import json
 import uuid
 import time
@@ -14,6 +13,7 @@ import queue
 import shutil
 import threading
 import subprocess
+from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 
@@ -24,9 +24,17 @@ from flask import (
 import pandas as pd
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['DOWNLOAD_FOLDER'] = 'downloads'
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
+
+# ── Vercel detection: use /tmp when running on Vercel ──
+IS_VERCEL = os.environ.get('VERCEL') == '1'
+if IS_VERCEL:
+    app.config['DOWNLOAD_FOLDER'] = '/tmp/downloads'
+    app.config['UPLOAD_FOLDER']   = '/tmp/uploads'
+else:
+    app.config['DOWNLOAD_FOLDER'] = 'downloads'
+    app.config['UPLOAD_FOLDER']   = 'uploads'
+
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['DOWNLOAD_FOLDER'], exist_ok=True)
@@ -35,12 +43,55 @@ os.makedirs(app.config['DOWNLOAD_FOLDER'], exist_ok=True)
 jobs = {}
 
 
+# ─────────────────────────── HELPERS ──────────────────────────
+
+def _ytdlp_version():
+    """Return yt-dlp version string or None."""
+    try:
+        r = subprocess.run(
+            [sys.executable, '-m', 'yt_dlp', '--version'],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode == 0:
+            return r.stdout.strip().split('\n')[0]
+    except Exception:
+        pass
+    return None
+
+
+def _ffmpeg_version():
+    """Return ffmpeg version string or None."""
+    try:
+        r = subprocess.run(
+            ['ffmpeg', '-version'],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode == 0:
+            return r.stdout.strip().split('\n')[0]
+    except Exception:
+        pass
+    return None
+
+
 # ─────────────────────────── ROUTES ───────────────────────────
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
+
+# ── Status ──────────────────────────────────────────────────
+
+@app.route('/api/status')
+def api_status():
+    """Return yt-dlp and ffmpeg version info."""
+    return jsonify({
+        'ytdlp':  _ytdlp_version(),
+        'ffmpeg': _ffmpeg_version(),
+    })
+
+
+# ── File Upload ──────────────────────────────────────────────
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
@@ -67,8 +118,8 @@ def upload_file():
 
         cols_lower = {c.lower(): c for c in df.columns}
 
-        track_candidates  = ['track name','track','song','title','song name','name']
-        artist_candidates = ['artist name','artist','artists','performer','band']
+        track_candidates  = ['track name', 'track', 'song', 'title', 'song name', 'name']
+        artist_candidates = ['artist name', 'artist', 'artists', 'performer', 'band']
 
         track_col  = next((cols_lower[c] for c in track_candidates  if c in cols_lower), None)
         artist_col = next((cols_lower[c] for c in artist_candidates if c in cols_lower), None)
@@ -82,7 +133,7 @@ def upload_file():
         songs = []
         skipped = 0
         for _, row in df.iterrows():
-            t = str(row[track_col]).strip() if pd.notna(row[track_col]) else ''
+            t = str(row[track_col]).strip()  if pd.notna(row[track_col])  else ''
             a = str(row[artist_col]).strip() if pd.notna(row[artist_col]) else ''
             if not t or not a or t == 'nan' or a == 'nan':
                 skipped += 1
@@ -105,11 +156,13 @@ def upload_file():
         return jsonify({'error': str(e)}), 500
 
 
+# ── Tool Check ───────────────────────────────────────────────
+
 @app.route('/api/check-tool', methods=['POST'])
 def check_tool():
-    """Check if a CLI tool is installed."""
+    """Check if yt-dlp or ffmpeg is installed."""
     data = request.get_json()
-    tool = data.get('tool', 'spotdl')
+    tool = data.get('tool', 'yt-dlp')
 
     def run_check(cmd):
         try:
@@ -125,76 +178,148 @@ def check_tool():
         ok, ver = run_check(['ffmpeg', '-version'])
         return jsonify({'installed': ok, 'version': ver})
 
-    # Try as Python module first (works on Anaconda), then as CLI
-    module_map = {'spotdl': 'spotdl', 'yt-dlp': 'yt_dlp', 'deemix': 'deemix'}
-    mod = module_map.get(tool)
-
-    if mod:
-        ok, ver = run_check([sys.executable, '-m', mod, '--version'])
-        if ok:
-            return jsonify({'installed': True, 'version': ver})
-
-    # Fallback: direct CLI
-    ok, ver = run_check([tool, '--version'])
+    # yt-dlp via Python module (works on Anaconda)
+    ok, ver = run_check([sys.executable, '-m', 'yt_dlp', '--version'])
     return jsonify({'installed': ok, 'version': ver})
 
 
-@app.route('/api/install-tool', methods=['POST'])
-def install_tool():
-    """Install a tool via pip (streams output)."""
-    data = request.get_json()
-    tool = data.get('tool', 'spotdl')
+# ── Search ───────────────────────────────────────────────────
 
-    pip_packages = {
-        'spotdl': 'spotdl',
-        'yt-dlp': 'yt-dlp',
-        'deemix': 'deemix',
-    }
+@app.route('/api/search', methods=['POST'])
+def api_search():
+    """Search YouTube for songs via yt-dlp."""
+    data = request.get_json() or {}
+    query = (data.get('query') or '').strip()
+    if not query:
+        return jsonify({'error': 'query required'}), 400
 
-    if tool not in pip_packages:
-        return jsonify({'error': 'Unknown tool'}), 400
-
-    def generate():
-        cmd = [sys.executable, '-m', 'pip', 'install', pip_packages[tool], '--upgrade']
-        yield f"data: $ {' '.join(cmd)}\n\n"
-
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True
+    try:
+        r = subprocess.run(
+            [sys.executable, '-m', 'yt_dlp',
+             f'ytsearch10:{query}',
+             '--dump-json', '--flat-playlist',
+             '--no-warnings', '--quiet'],
+            capture_output=True, text=True, timeout=20
         )
-        for line in proc.stdout:
-            yield f"data: {line.rstrip()}\n\n"
-        proc.wait()
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Search timed out. Try again.'}), 504
 
-        if proc.returncode == 0:
-            yield f"data: ✅ {tool} installed successfully!\n\n"
-            yield "data: __DONE__\n\n"
-        else:
-            yield f"data: ❌ Installation failed (exit {proc.returncode})\n\n"
-            yield "data: __ERROR__\n\n"
+    results = []
+    for line in r.stdout.strip().splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        dur = item.get('duration') or 0
+        try:
+            m, s = divmod(int(float(dur)), 60)
+        except (ValueError, TypeError):
+            m, s = 0, 0
+        vid_id = item.get('id', '')
+        results.append({
+            'id':        vid_id,
+            'title':     item.get('title', 'Unknown'),
+            'uploader':  item.get('uploader') or item.get('channel', 'Unknown'),
+            'duration':  f'{m}:{s:02d}',
+            'thumbnail': f'https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg',
+            'url':       f'https://www.youtube.com/watch?v={vid_id}',
+        })
+    return jsonify({'results': results})
 
-    return Response(stream_with_context(generate()),
-                    content_type='text/event-stream')
 
+# ── Single Download ──────────────────────────────────────────
+
+@app.route('/api/download-single', methods=['POST'])
+def api_download_single():
+    """Download a single song and stream the file to the browser."""
+    data = request.get_json() or {}
+    url     = (data.get('url')     or '').strip()
+    query   = (data.get('query')   or '').strip()
+    bitrate = (data.get('bitrate') or '320k').strip()
+    fmt     = (data.get('format')  or 'mp3').strip()
+
+    if not url and not query:
+        return jsonify({'error': 'url or query required'}), 400
+
+    target  = url if url else f'ytsearch1:{query}'
+    quality = bitrate.replace('k', '')
+
+    tmp_dir = os.path.join(app.config['DOWNLOAD_FOLDER'], f'single_{uuid.uuid4().hex[:8]}')
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    has_ffmpeg = _ffmpeg_version() is not None
+    cmd = [
+        sys.executable, '-m', 'yt_dlp',
+        target,
+        '--extract-audio',
+        '--audio-quality', quality,
+        '--output', os.path.join(tmp_dir, '%(title)s.%(ext)s'),
+        '--embed-thumbnail',
+        '--add-metadata',
+        '--no-playlist',
+        '--socket-timeout', '20',
+        '--retries', '3',
+        '--quiet',
+    ]
+    if has_ffmpeg:
+        cmd += ['--audio-format', fmt]
+    else:
+        cmd += ['--audio-format', 'best']
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return jsonify({'error': 'Download timed out'}), 504
+
+    if result.returncode != 0:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        err = (result.stderr or '').strip()[:300]
+        return jsonify({'error': f'yt-dlp failed: {err}'}), 500
+
+    # Find downloaded file
+    files = list(Path(tmp_dir).glob(f'*.{fmt}'))
+    if not files:
+        files = list(Path(tmp_dir).glob('*.*'))
+    if not files:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return jsonify({'error': 'Download succeeded but no file found'}), 500
+
+    filepath = files[0]
+    dl_name  = filepath.name
+
+    # Schedule cleanup after send
+    def _cleanup():
+        time.sleep(10)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    threading.Thread(target=_cleanup, daemon=True).start()
+
+    return send_file(
+        str(filepath),
+        as_attachment=True,
+        download_name=dl_name
+    )
+
+
+# ── Bulk Download — Start ────────────────────────────────────
 
 @app.route('/api/start-download', methods=['POST'])
 def start_download():
-    """Start a background download job."""
-    data = request.get_json()
-    songs  = data.get('songs', [])
-    tool   = data.get('tool', 'spotdl')
+    """Start a background bulk download job."""
+    data    = request.get_json()
+    songs   = data.get('songs', [])
     bitrate = data.get('bitrate', '320k')
-    fmt    = data.get('format', 'mp3')
+    fmt     = data.get('format', 'mp3')
 
     if not songs:
         return jsonify({'error': 'No songs provided'}), 400
 
-    job_id = str(uuid.uuid4())[:8]
+    job_id    = str(uuid.uuid4())[:8]
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    out_dir = os.path.join(app.config['DOWNLOAD_FOLDER'], f"music_{timestamp}")
+    out_dir   = os.path.join(app.config['DOWNLOAD_FOLDER'], f'music_{timestamp}')
     os.makedirs(out_dir, exist_ok=True)
 
-    # Write songs.txt
     songs_file = os.path.join(out_dir, 'songs.txt')
     with open(songs_file, 'w', encoding='utf-8') as f:
         for s in songs:
@@ -202,28 +327,28 @@ def start_download():
 
     log_q = queue.Queue()
     jobs[job_id] = {
-        'status':    'running',
-        'songs':     songs,
-        'done':      [],
-        'failed':    [],
-        'out_dir':   out_dir,
+        'status':     'running',
+        'songs':      songs,
+        'done':       [],
+        'failed':     [],
+        'out_dir':    out_dir,
         'songs_file': songs_file,
-        'tool':      tool,
-        'bitrate':   bitrate,
-        'format':    fmt,
-        'log_queue': log_q,
-        'started':   time.time(),
+        'bitrate':    bitrate,
+        'format':     fmt,
+        'log_queue':  log_q,
+        'started':    time.time(),
     }
 
-    thread = threading.Thread(
+    threading.Thread(
         target=run_download_job,
         args=(job_id,),
         daemon=True
-    )
-    thread.start()
+    ).start()
 
     return jsonify({'job_id': job_id, 'out_dir': out_dir})
 
+
+# ── Bulk Download — Stream SSE ───────────────────────────────
 
 @app.route('/api/stream/<job_id>')
 def stream_job(job_id):
@@ -234,7 +359,6 @@ def stream_job(job_id):
     def generate():
         job = jobs[job_id]
         q   = job['log_queue']
-
         while True:
             try:
                 msg = q.get(timeout=30)
@@ -242,13 +366,16 @@ def stream_job(job_id):
                 if msg.get('type') == 'done':
                     break
             except queue.Empty:
-                yield "data: {\"type\":\"ping\"}\n\n"
+                yield 'data: {"type":"ping"}\n\n'
 
-    return Response(stream_with_context(generate()),
-                    content_type='text/event-stream',
-                    headers={'Cache-Control': 'no-cache',
-                             'X-Accel-Buffering': 'no'})
+    return Response(
+        stream_with_context(generate()),
+        content_type='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
+    )
 
+
+# ── Bulk Download — Job Status ───────────────────────────────
 
 @app.route('/api/job/<job_id>')
 def job_status(job_id):
@@ -265,20 +392,21 @@ def job_status(job_id):
     })
 
 
+# ── Download ZIP ─────────────────────────────────────────────
+
 @app.route('/api/download-zip/<job_id>')
 def download_zip(job_id):
-    """Zip the output folder and send it."""
-    # Try in-memory job store first
+    """Zip the output folder and send it. Works even after server restart."""
     out_dir = None
     if job_id in jobs:
         out_dir = jobs[job_id]['out_dir']
 
-    # Fallback: find latest folder in downloads/
+    # Fallback: find most recently modified folder in downloads/
     if not out_dir or not os.path.exists(out_dir):
-        dl_base = app.config['DOWNLOAD_FOLDER']
+        base = app.config['DOWNLOAD_FOLDER']
         folders = [
-            os.path.join(dl_base, f) for f in os.listdir(dl_base)
-            if os.path.isdir(os.path.join(dl_base, f))
+            os.path.join(base, f) for f in os.listdir(base)
+            if os.path.isdir(os.path.join(base, f))
         ]
         if folders:
             out_dir = max(folders, key=os.path.getmtime)
@@ -292,67 +420,54 @@ def download_zip(job_id):
     return send_file(
         zip_path + '.zip',
         as_attachment=True,
-        download_name=f"music_{job_id}.zip"
+        download_name=f'music_{job_id}.zip'
     )
 
+
+# ── Download Failed TXT ──────────────────────────────────────
 
 @app.route('/api/download-txt/<job_id>')
 def download_failed_txt(job_id):
     """Download failed_songs.txt for retry."""
     if job_id not in jobs:
         return jsonify({'error': 'Not found'}), 404
-    job = jobs[job_id]
-    failed = job.get('failed', [])
-    content = '\n'.join(failed)
-    from io import BytesIO
-    buf = BytesIO(content.encode('utf-8'))
+    job     = jobs[job_id]
+    content = '\n'.join(job.get('failed', []))
+    buf     = BytesIO(content.encode('utf-8'))
     return send_file(buf, as_attachment=True,
                      download_name='failed_songs.txt',
                      mimetype='text/plain')
 
 
-# ─────────────────────── DOWNLOAD ENGINE ───────────────────────
+# ─────────────────────── DOWNLOAD ENGINE ────────────────────
 
-# Tuning constants
-YTDLP_WORKERS    = 4    # parallel yt-dlp threads
-YTDLP_TIMEOUT    = 45   # seconds per song before skip
-SPOTDL_THREADS   = 6    # spotdl parallel threads
-SPOTDL_TIMEOUT   = 300  # total spotdl batch timeout (seconds per ~20 songs)
+YTDLP_WORKERS = 4   # parallel workers
+YTDLP_TIMEOUT = 45  # seconds per song
 
 
 def run_download_job(job_id):
-    job = jobs[job_id]
-    q   = job['log_queue']
-    songs      = job['songs']
-    tool       = job['tool']
-    bitrate    = job['bitrate']
-    fmt        = job['format']
-    out_dir    = job['out_dir']
-    songs_file = job['songs_file']
+    job     = jobs[job_id]
+    q       = job['log_queue']
+    songs   = job['songs']
+    bitrate = job['bitrate']
+    fmt     = job['format']
+    out_dir = job['out_dir']
 
     def log(msg_type, text, song=None, idx=None):
         q.put({'type': msg_type, 'text': text, 'song': song, 'idx': idx,
                'done': len(job['done']), 'failed': len(job['failed']),
                'total': len(songs)})
 
-    log('info', f"🚀 Starting {tool} — {len(songs)} songs")
-    log('info', f"   Quality: {bitrate} | Format: {fmt}")
-    log('info', f"   Output:  {out_dir}")
-    if tool == 'yt-dlp':
-        log('info', f"   Workers: {YTDLP_WORKERS} parallel | Timeout: {YTDLP_TIMEOUT}s/song")
-    elif tool == 'spotdl':
-        log('info', f"   Threads: {SPOTDL_THREADS} parallel")
-    log('info', "")
+    log('info', f'🚀 Starting yt-dlp — {len(songs)} songs')
+    log('info', f'   Quality: {bitrate} | Format: {fmt}')
+    log('info', f'   Output:  {out_dir}')
+    log('info', f'   Workers: {YTDLP_WORKERS} parallel | Timeout: {YTDLP_TIMEOUT}s/song')
+    log('info', '')
 
     try:
-        if tool == 'spotdl':
-            _run_spotdl(job, log)
-        elif tool == 'yt-dlp':
-            _run_ytdlp_parallel(job, log)
-        elif tool == 'deemix':
-            _run_deemix(job, log)
+        _run_ytdlp_parallel(job, log)
     except Exception as e:
-        log('error', f"❌ Fatal error: {e}")
+        log('error', f'❌ Fatal error: {e}')
 
     # Write failed list
     if job['failed']:
@@ -362,95 +477,20 @@ def run_download_job(job_id):
                 f.write(s + '\n')
 
     elapsed = round(time.time() - job['started'], 1)
-    mins = int(elapsed // 60)
-    secs = int(elapsed % 60)
-    log('info', "")
-    log('info', f"✅ Done in {mins}m {secs}s — {len(job['done'])} downloaded, {len(job['failed'])} failed")
+    mins    = int(elapsed // 60)
+    secs    = int(elapsed % 60)
+    log('info', '')
+    log('info', f'✅ Done in {mins}m {secs}s — {len(job["done"])} downloaded, {len(job["failed"])} failed')
     job['status'] = 'done'
     log('done', '__DONE__')
-
-
-def _run_spotdl(job, log):
-    """
-    SpotDL bulk download — fastest method.
-    Uses multiple threads, processes all songs in one command.
-    Estimated speed: ~15-20 songs/minute with 6 threads.
-    """
-    songs_file = job['songs_file']
-    out_dir    = job['out_dir']
-    bitrate    = job['bitrate']
-    fmt        = job['format']
-    songs      = job['songs']
-    total      = len(songs)
-
-    cmd = [
-        sys.executable, '-m', 'spotdl', 'download',
-        songs_file,
-        '--bitrate',      bitrate,
-        '--format',       fmt,
-        '--output',       out_dir,
-        '--threads',      str(SPOTDL_THREADS),
-        '--log-level',    'INFO',
-    ]
-
-    log('cmd', '$ ' + ' '.join(cmd))
-    log('info', f"⚡ SpotDL processing {total} songs with {SPOTDL_THREADS} threads...")
-
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True, bufsize=1
-    )
-
-    done_count = 0
-    fail_count = 0
-
-    for line in proc.stdout:
-        line = line.strip()
-        if not line:
-            continue
-
-        # Detect downloaded songs
-        if any(kw in line for kw in ('Downloaded', 'Saved', '✓', 'complete')):
-            done_count += 1
-            job['done'].append(line)
-            log('ok', f"✅ [{done_count}/{total}] {line}", idx=done_count - 1)
-
-        # Detect skipped/failed
-        elif any(kw in line for kw in ('Skipping', 'Failed', 'Error', 'Could not')):
-            fail_count += 1
-            job['failed'].append(line)
-            log('error', f"❌ {line}")
-
-        # Rate limit hit — warn user
-        elif 'rate' in line.lower() and 'limit' in line.lower():
-            log('error', f"⚠️  Rate limit hit! Pausing 30s... ({line})")
-            time.sleep(30)
-
-        # Progress info
-        elif any(kw in line for kw in ('Downloading', 'Converting', 'Processing')):
-            log('info', f"   {line}")
-
-        else:
-            log('out', line)
-
-    proc.wait()
-
-    # Count actual files downloaded as ground truth
-    actual = len([f for f in os.listdir(out_dir)
-                  if f.endswith(('.mp3', '.m4a', '.flac', '.opus', '.webm'))])
-    if actual > done_count:
-        job['done'] = list(range(actual))  # pad count
-        log('ok', f"   ✅ Verified: {actual} files in output folder")
 
 
 def _run_ytdlp_parallel(job, log):
     """
     yt-dlp parallel download using ThreadPoolExecutor.
     Downloads YTDLP_WORKERS songs simultaneously.
-    Each song has a hard YTDLP_TIMEOUT second timeout — auto-skips if stuck.
-    Estimated speed: ~8-12 songs/minute with 4 workers.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeout
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     songs   = job['songs']
     out_dir = job['out_dir']
@@ -458,19 +498,18 @@ def _run_ytdlp_parallel(job, log):
     fmt     = job['format']
     quality = bitrate.replace('k', '')
     total   = len(songs)
+    lock    = threading.Lock()
 
-    # Thread-safe counter lock
-    lock = threading.Lock()
+    has_ffmpeg = _ffmpeg_version() is not None
 
     def download_one(args):
         idx, song = args
-        query    = f"ytsearch1:{song}"    # standard YouTube search, works on all yt-dlp versions
+        query    = f'ytsearch1:{song}'
         out_tmpl = os.path.join(out_dir, '%(title)s.%(ext)s')
 
         cmd = [
             sys.executable, '-m', 'yt_dlp',
             '--extract-audio',
-            '--audio-format',     fmt,
             '--audio-quality',    quality,
             '--output',           out_tmpl,
             '--embed-thumbnail',
@@ -478,18 +517,20 @@ def _run_ytdlp_parallel(job, log):
             '--no-playlist',
             '--quiet',
             '--no-warnings',
-            '--socket-timeout',   '15',       # network timeout per request
-            '--retries',          '2',        # retry twice on network error
+            '--socket-timeout',   '15',
+            '--retries',          '2',
             '--fragment-retries', '2',
-            query
         ]
+        if has_ffmpeg:
+            cmd += ['--audio-format', fmt]
+        else:
+            cmd += ['--audio-format', 'best']
+        cmd.append(query)
 
         try:
             result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=YTDLP_TIMEOUT      # hard kill if stuck
+                cmd, capture_output=True, text=True,
+                timeout=YTDLP_TIMEOUT
             )
             success = result.returncode == 0
             err = result.stderr.strip()[:120] if result.stderr else ''
@@ -499,7 +540,9 @@ def _run_ytdlp_parallel(job, log):
         except Exception as e:
             return idx, song, False, str(e)[:100]
 
-    log('info', f"⚡ Launching {YTDLP_WORKERS} parallel workers...")
+    log('info', f'⚡ Launching {YTDLP_WORKERS} parallel workers...')
+    if not has_ffmpeg:
+        log('info', '⚠️  FFmpeg not found — downloading as best available (webm/opus)')
 
     with ThreadPoolExecutor(max_workers=YTDLP_WORKERS) as executor:
         futures = {executor.submit(download_one, (i, s)): (i, s)
@@ -514,56 +557,23 @@ def _run_ytdlp_parallel(job, log):
                 idx, song, success, err = orig_idx, orig_song, False, str(e)
 
             completed += 1
-
             with lock:
                 if success:
                     job['done'].append(song)
-                    log('ok',
-                        f"✅ [{completed}/{total}] {song}",
-                        song=song, idx=idx)
+                    log('ok', f'✅ [{completed}/{total}] {song}', song=song, idx=idx)
                 else:
                     job['failed'].append(song)
                     log('error',
-                        f"❌ [{completed}/{total}] {song}" +
-                        (f" — {err}" if err else ""),
+                        f'❌ [{completed}/{total}] {song}' + (f' — {err}' if err else ''),
                         song=song, idx=idx)
 
 
-def _run_deemix(job, log):
-    """Deemix: requires ARL token. Sequential but reliable for FLAC."""
-    songs   = job['songs']
-    out_dir = job['out_dir']
-    bitrate = job['bitrate']
-
-    quality_map = {'128k': '128', '256k': '256', '320k': '320', 'flac': 'flac'}
-    q_flag = quality_map.get(bitrate, '320')
-
-    log('warn', '⚠️  Deemix requires a valid Deezer ARL token in ~/.config/deemix/')
-    log('info', '')
-
-    for idx, song in enumerate(songs):
-        log('info', f"[{idx+1}/{len(songs)}] {song}", song=song, idx=idx)
-        cmd = ['deemix', '-b', q_flag, '-p', out_dir, song]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if result.returncode == 0:
-                job['done'].append(song)
-                log('ok', f"  ✅ {song}", song=song, idx=idx)
-            else:
-                job['failed'].append(song)
-                log('error', f"  ❌ {song}", song=song, idx=idx)
-        except subprocess.TimeoutExpired:
-            job['failed'].append(song)
-            log('error', f"  ⏱ Timeout: {song} — skipped", song=song, idx=idx)
-        time.sleep(0.3)
-
-
-# ───────────────────────────── MAIN ─────────────────────────────
+# ───────────────────────────── MAIN ─────────────────────────
 
 if __name__ == '__main__':
     print("""
 ╔══════════════════════════════════════════════╗
-║      🎵  Music Pipeline — Local Server       ║
+║       🎵  MusicDL — Local Server             ║
 ╠══════════════════════════════════════════════╣
 ║  URL:  http://localhost:5000                 ║
 ║  Stop: Ctrl + C                              ║
